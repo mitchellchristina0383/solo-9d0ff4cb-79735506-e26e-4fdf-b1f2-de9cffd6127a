@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from . import config, db, models, node_client
+from . import config, db, models, node_client, reliability
 
 
 def now() -> str:
@@ -48,6 +48,7 @@ def init_db() -> None:
                 "VALUES(?,?,?,?,?)",
                 (n.node_id, n.name, n.base_url, n.capacity_mb, now()),
             )
+            reliability.ensure_settings(conn, n.node_id)
 
 
 def log_event(conn, event_type: str, detail: str, deployment_id: str | None = None,
@@ -262,6 +263,8 @@ async def _load_replica(rid: str) -> None:
 
     with db.tx() as conn:
         _set_replica(conn, rid, models.REP_LOADING)
+        # 一次加载下发 = 一条可靠性样本；轮询/对账/迟到回执都不会再新增
+        reliability.record_dispatch(conn, rep)
         log_event(conn, "LOAD_SEND", f"向 {node.name} 下发加载 {dep['model_name']}（epoch={rep['epoch']}）",
                   dep["id"], rid, node.node_id)
 
@@ -277,12 +280,15 @@ async def _load_replica(rid: str) -> None:
             log_event(conn, "LOAD_ACK", f"{node.name} 受理加载，等待确认", dep["id"], rid, node.node_id)
             mark_node_online(node.node_id)
         elif result.transport_failed:
+            # 传输层失败：本次下发未按时确认，样本记为逾期；副本侧仍保留占用待核
+            reliability.settle_overdue(conn, rid, rep["epoch"])
             _set_replica(conn, rid, models.REP_TIMEOUT, error=result.error)
             log_event(conn, "LOAD_TIMEOUT", result.error, dep["id"], rid, node.node_id)
             mark_node_lost(node.node_id, result.error)
             _evaluate(conn, dep["id"])
         else:
             # 节点明确拒绝/HTTP 故障：确认未占用，释放本侧预留
+            reliability.settle_failed(conn, rid, rep["epoch"])
             _set_replica(conn, rid, models.REP_LOAD_FAILED, error=result.error, released=True)
             log_event(conn, "LOAD_FAIL", result.error, dep["id"], rid, node.node_id)
             _evaluate(conn, dep["id"])
@@ -308,6 +314,7 @@ async def poll_loading() -> None:
             if result.transport_failed:
                 mark_node_lost(node.node_id, result.error)
                 if waited >= config.LOAD_TIMEOUT:
+                    reliability.settle_overdue(conn, rep["id"], rep["epoch"])
                     _set_replica(conn, rep["id"], models.REP_TIMEOUT,
                                  error=result.error or "节点失联，加载状态未知")
                     log_event(conn, "LOAD_TIMEOUT",
@@ -317,17 +324,20 @@ async def poll_loading() -> None:
                 # 未超时则继续等待，维持 LOADING 与预留
                 continue
             if remote == "loaded":
+                reliability.settle_confirmation(conn, rep["id"], rep["epoch"])
                 _set_replica(conn, rep["id"], models.REP_LOADED, confirmed=True)
                 log_event(conn, "LOAD_CONFIRMED", f"{node.name} 确认加载完成",
                           dep["id"], rep["id"], node.node_id)
                 _evaluate(conn, dep["id"])
             elif remote == "failed":
+                reliability.settle_failed(conn, rep["id"], rep["epoch"])
                 _set_replica(conn, rep["id"], models.REP_LOAD_FAILED,
                              error="节点上报加载失败", released=True)
                 log_event(conn, "LOAD_FAIL", "节点上报加载失败", dep["id"], rep["id"], node.node_id)
                 _evaluate(conn, dep["id"])
             elif remote == "unknown":
                 # 节点明确不存在该副本，远端不占显存，本侧预留可释放
+                reliability.settle_failed(conn, rep["id"], rep["epoch"])
                 _set_replica(conn, rep["id"], models.REP_LOAD_FAILED,
                              error="对账发现节点上无此副本（加载未生效）", released=True)
                 log_event(conn, "LOAD_MISSING", "节点上无此副本，释放预留",
@@ -335,6 +345,7 @@ async def poll_loading() -> None:
                 _evaluate(conn, dep["id"])
             else:  # loading / unloading：仍在途
                 if waited >= config.LOAD_TIMEOUT:
+                    reliability.settle_overdue(conn, rep["id"], rep["epoch"])
                     _set_replica(conn, rep["id"], models.REP_TIMEOUT,
                                  error=f"加载超过 {config.LOAD_TIMEOUT:.0f}s 未确认，保留占用待核")
                     log_event(conn, "LOAD_TIMEOUT", "节点在途过久，转待核",
@@ -430,6 +441,8 @@ async def reconcile(dep_id: str) -> dict:
             st = cur["status"]
             if remote == "loaded":
                 mark_node_online(node.node_id)
+                # 样本判定独立且冻结：若已过截止时间，这里补确认成功仍记为逾期
+                reliability.settle_confirmation(conn, cur["id"], cur["epoch"])
                 if st in (models.REP_LOADING, models.REP_TIMEOUT, models.REP_UNVERIFIED):
                     # 超时/待核后核实加载其实已成功：同一 epoch 的合法补确认
                     _set_replica(conn, cur["id"], models.REP_LOADED, confirmed=True)
@@ -459,12 +472,14 @@ async def reconcile(dep_id: str) -> dict:
                     log_event(conn, "RECONCILE_MISMATCH", "账本已加载但节点无此副本",
                               dep_id, cur["id"], node.node_id)
                 else:  # PENDING/LOADING
+                    reliability.settle_failed(conn, cur["id"], cur["epoch"])
                     _set_replica(conn, cur["id"], models.REP_LOAD_FAILED,
                                  error="对账发现节点无此副本，加载未生效", released=True)
                     notes.append(f"{node.name} 无此副本，判定加载失败")
                     log_event(conn, "RECONCILE_MISSING", "加载未生效",
                               dep_id, cur["id"], node.node_id)
             elif remote == "failed":
+                reliability.settle_failed(conn, cur["id"], cur["epoch"])
                 _set_replica(conn, cur["id"], models.REP_LOAD_FAILED,
                              error="节点上报 failed", released=True)
                 notes.append(f"{node.name} 上报失败，释放预留")
@@ -482,6 +497,9 @@ async def reconcile(dep_id: str) -> dict:
         (dep_id, dep["epoch"], models.REP_UNVERIFIED, models.REP_RELEASING),
     ):
         await request_release(rep["id"], "对账后撤销旧加载")
+
+    # 可靠性样本与告警独立评估；不改变上面任何副本/部署/显存状态
+    reliability.evaluate_all()
 
     updated = get_deployment(dep_id)
     updated["reconcile_notes"] = notes or ["所有副本与节点状态一致"]

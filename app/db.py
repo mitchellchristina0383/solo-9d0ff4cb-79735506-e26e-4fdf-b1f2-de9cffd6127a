@@ -57,6 +57,45 @@ CREATE TABLE IF NOT EXISTS events (
     detail         TEXT,
     created_at     TEXT NOT NULL
 );
+-- 加载可靠性样本：每次加载下发一条。状态一经判定为按时/失败/逾期即冻结，
+-- 后续对账、迟到回执、轮询都只更新同一行，不会新增样本或改写结论。
+CREATE TABLE IF NOT EXISTS load_samples (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    replica_id     TEXT NOT NULL,
+    deployment_id  TEXT NOT NULL,
+    epoch          INTEGER NOT NULL,
+    node_id        TEXT NOT NULL,
+    dispatched_at  TEXT NOT NULL,
+    deadline_at    TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    decided_at     TEXT,
+    UNIQUE(replica_id, epoch)
+);
+CREATE INDEX IF NOT EXISTS idx_samples_node_time ON load_samples(node_id, dispatched_at);
+CREATE TABLE IF NOT EXISTS node_alert_settings (
+    node_id           TEXT PRIMARY KEY,
+    window_seconds    REAL NOT NULL,
+    min_samples       INTEGER NOT NULL,
+    abnormal_ratio    REAL NOT NULL,
+    updated_at        TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS node_alerts (
+    node_id          TEXT PRIMARY KEY,
+    status           TEXT NOT NULL,
+    firing_since     TEXT,
+    recovered_at     TEXT,
+    last_evaluated_at TEXT NOT NULL,
+    window_seconds   REAL NOT NULL,
+    min_samples      INTEGER NOT NULL,
+    abnormal_ratio   REAL NOT NULL,
+    sample_count     INTEGER NOT NULL,
+    on_time_count    INTEGER NOT NULL,
+    failed_count     INTEGER NOT NULL,
+    overdue_count    INTEGER NOT NULL,
+    pending_count    INTEGER NOT NULL DEFAULT 0,
+    abnormal_ratio_actual REAL,
+    detail           TEXT
+);
 """
 
 

@@ -47,6 +47,20 @@
                 margin-bottom:8px; font-size:13px; } .toast-item.err{background:#991b1b;}
   .controls button { margin-top:6px; }
   details summary { cursor:pointer; font-size:13px; color:var(--blue); margin:6px 0; }
+  .alert-card { border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin-bottom:12px; }
+  .alert-card.firing { border-color:#dc2626; background:#fef2f2; }
+  .alert-head { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .alert-counts { font-size:12px; margin:6px 0; }
+  .alert-counts span { margin-right:12px; }
+  .settings { display:flex; flex-wrap:wrap; gap:8px; align-items:flex-end; margin:8px 0; }
+  .settings label { margin:0; font-size:12px; }
+  .settings input { width:88px; padding:5px 7px; }
+  .settings button { padding:5px 10px; }
+  .samples { max-height:190px; overflow:auto; font-size:12px; margin-top:6px; }
+  .samples table { font-size:12px; } .samples th,.samples td { padding:4px 6px; }
+  .ratio-bar { height:6px; background:#e5e7eb; border-radius:3px; overflow:hidden; margin:4px 0; }
+  .ratio-bar > div { height:100%; background:#16a34a; }
+  .ratio-bar > div.bad { background:#dc2626; }
 </style>
 </head>
 <body>
@@ -92,6 +106,15 @@
       <tbody id="deployments"></tbody>
     </table>
   </div>
+  <div class="card">
+    <h2>加载可靠性告警（按节点）</h2>
+    <div class="muted" style="margin-bottom:10px">
+      以每次加载下发为一次样本；统计观察窗内 <b>按时确认 / 失败 / 逾期</b>。有效样本数达到最低样本数
+      且异常比例（失败+逾期）达到阈值时告警；只有新近有效样本数仍达到最低样本数且异常比例低于阈值才恢复，
+      <b>窗口为空或样本不足不算恢复</b>。加载逾期后即使对账确认成功，该样本仍计为逾期。
+    </div>
+    <div id="alerts"></div>
+  </div>
 </main>
 <div id="toast"></div>
 
@@ -115,10 +138,16 @@ function badge(cn, kind){ return `<span class="badge ${BADGE[kind]||'badge-secon
 
 async function refresh(){
   try{
-    const [nodes, deps, events] = await Promise.all([
-      api('/api/nodes'), api('/api/deployments'), api('/api/events?limit=20')
+    const [nodes, deps, events, rel] = await Promise.all([
+      api('/api/nodes'), api('/api/deployments'), api('/api/events?limit=20'),
+      api('/api/reliability')
     ]);
     renderNodes(nodes); renderFaults(nodes); renderDeps(deps); renderEvents(events);
+    // 正在编辑阈值输入框时跳过告警面板重绘，避免 2 秒轮询覆盖用户输入
+    const active = document.activeElement;
+    if (!(active && active.tagName === 'INPUT' && active.closest('#alerts'))) {
+      renderAlerts(rel);
+    }
     document.getElementById('clock').textContent = '更新于 ' + new Date().toLocaleTimeString();
   }catch(e){ toast('刷新失败: '+e.message, true); }
 }
@@ -195,6 +224,93 @@ function renderEvents(events){
   document.getElementById('events').innerHTML =
     events.map(e=>`<div>${esc(e.created_at)} <b>[${esc(e.event_type)}]</b>
       ${e.node_id?esc(e.node_id)+' ':''}${esc(e.detail||'')}</div>`).join('');
+}
+
+const SAMPLE_BADGE={ON_TIME:'success',FAILED:'danger',OVERDUE:'warning',PENDING:'secondary'};
+
+function windowLabel(sec){
+  if(sec % 60 === 0) return (sec/60) + ' 分钟';
+  return sec + ' 秒';
+}
+function renderAlerts(rel){
+  const html = rel.nodes.map(n=>{
+    const a = n.alert, cfg = a.config || n.config;
+    const firing = a.status === 'ALERT';
+    const ratio = a.abnormal_ratio;
+    const ratioText = ratio===null||ratio===undefined ? '—' : (ratio*100).toFixed(1)+'%';
+    const pct = ratio===null||ratio===undefined ? 0 : Math.min(100, Math.round(ratio*100));
+    const samples = n.samples.map(s=>`<tr>
+        <td>${esc(s.replica_id)}</td><td>${esc(s.model_name||'')}</td>
+        <td>第 ${s.epoch} 轮</td>
+        <td>${badge(s.status_cn, SAMPLE_BADGE[s.status]||'secondary')}</td>
+        <td>${esc((s.dispatched_at||'').replace('T',' ').slice(0,19))}</td>
+        <td>${esc((s.decided_at||'').replace('T',' ').slice(0,19)||'—')}</td>
+      </tr>`).join('');
+    const abnormal = (n.abnormal_samples||[]).map(s=>
+      `<div class="rep">${esc(s.status_cn)} · 副本 <b>${esc(s.replica_id)}</b> · 第 ${s.epoch} 轮
+       · ${esc(s.model_name||'')} · 下发 ${esc((s.dispatched_at||'').replace('T',' ').slice(0,19))}</div>`
+    ).join('') || '<div class="muted">观察窗内暂无失败/逾期副本</div>';
+    return `<div class="alert-card ${firing?'firing':''}">
+      <div class="alert-head">
+        <b>${esc(n.name)} <span class="muted">(${esc(n.node_id)})</span></b>
+        ${firing ? badge('告警中', 'danger') : badge('正常', 'success')}
+      </div>
+      <div class="alert-counts">
+        <span>观察窗 ${windowLabel(cfg.window_seconds)}</span>
+        <span>有效样本 ${a.sample_count} / 最低 ${cfg.min_samples}</span>
+        <span>按时 <b>${a.on_time_count}</b></span>
+        <span>失败 <b style="color:#dc2626">${a.failed_count}</b></span>
+        <span>逾期 <b style="color:#d97706">${a.overdue_count}</b></span>
+        <span>等待确认 ${a.pending_count}</span>
+        <span>异常率 <b>${ratioText}</b> / 阈值 ${(cfg.abnormal_ratio*100).toFixed(0)}%</span>
+      </div>
+      <div class="ratio-bar"><div class="${firing?'bad':''}" style="width:${pct}%"></div></div>
+      <div class="reason">${esc(a.detail||'')}</div>
+      <div class="muted">
+        触发时间 ${esc((a.firing_since||'—').replace('T',' ').slice(0,19))}
+        · 最近恢复 ${esc((a.recovered_at||'—').replace('T',' ').slice(0,19))}
+        · 评估于 ${esc((a.last_evaluated_at||'—').replace('T',' ').slice(0,19))}
+      </div>
+      <div style="margin-top:6px;font-size:12px"><b>失败/逾期副本与轮次</b></div>
+      <div class="samples">${abnormal}</div>
+      <div class="settings">
+        <div><label>观察窗(秒)</label><input id="win-${n.node_id}" type="number" min="1" value="${cfg.window_seconds}"></div>
+        <div><label>最低样本数</label><input id="min-${n.node_id}" type="number" min="1" value="${cfg.min_samples}"></div>
+        <div><label>异常比例(0-1)</label><input id="ratio-${n.node_id}" type="number" min="0" max="1" step="0.05" value="${cfg.abnormal_ratio}"></div>
+        <button onclick="saveAlert('${n.node_id}')">保存阈值</button>
+        <button class="ghost" onclick="slowLoad('${n.node_id}')">模拟慢加载</button>
+      </div>
+      <details><summary>观察窗内样本（${n.samples.length}）</summary>
+        <div class="samples"><table>
+          <thead><tr><th>副本</th><th>模型</th><th>轮次</th><th>样本状态</th><th>下发</th><th>判定</th></tr></thead>
+          <tbody>${samples || '<tr><td colspan="6" class="muted">观察窗内暂无样本</td></tr>'}</tbody>
+        </table></div>
+      </details>
+    </div>`;
+  }).join('');
+  document.getElementById('alerts').innerHTML = html || '<div class="muted">暂无节点</div>';
+}
+async function saveAlert(id){
+  const body = {
+    window_seconds: Number(document.getElementById('win-'+id).value),
+    min_samples: Number(document.getElementById('min-'+id).value),
+    abnormal_ratio: Number(document.getElementById('ratio-'+id).value),
+  };
+  try{ await api(`/api/nodes/${id}/alert-settings`,{method:'PUT',body:JSON.stringify(body)});
+    toast('告警阈值已保存: '+id); refresh();
+  }catch(e){ toast(e.message,true); }
+}
+async function slowLoad(id){
+  // 一键复现慢加载：把该节点加载延迟调到超过平台加载时限（默认 30s），
+  // 再提交一个双副本部署（保证该节点必然分到一份）——该节点样本会迅速判为逾期。
+  try{
+    await api(`/api/nodes/${id}/control`,{method:'POST',
+      body:JSON.stringify({mode:'slow', load_delay:35})});
+    const d = await api('/api/deployments',{method:'POST', body:JSON.stringify({
+      model_name:'slow-demo', mem_per_replica_mb:512, replica_count:2})});
+    toast('已在 '+id+' 模拟慢加载（35s），部署 '+d.id+' 已提交');
+    refresh();
+  }catch(e){ toast(e.message,true); }
 }
 
 document.getElementById('deploy-form').addEventListener('submit', async (ev)=>{

@@ -12,13 +12,19 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import config, node_client, service
+from . import config, node_client, reliability, service
 
 
 class DeployBody(BaseModel):
     model_name: str = Field(min_length=1, max_length=64)
     mem_per_replica_mb: int = Field(gt=0, le=1_000_000)
     replica_count: Literal[1, 2]
+
+
+class AlertSettingsBody(BaseModel):
+    window_seconds: float = Field(gt=0, le=86400)
+    min_samples: int = Field(ge=1, le=10000)
+    abnormal_ratio: float = Field(ge=0, le=1)
 
 
 class ControlBody(BaseModel):
@@ -48,16 +54,28 @@ async def _health_loop() -> None:
         await asyncio.sleep(config.HEALTH_INTERVAL)
 
 
+async def _alert_loop() -> None:
+    """独立评估加载可靠性：冻结逾期样本、判定告警，与节点健康/部署状态无关。"""
+    while True:
+        try:
+            reliability.evaluate_all()
+        except Exception as exc:
+            print(f"[alert] {exc.__class__.__name__}: {exc}")
+        await asyncio.sleep(config.ALERT_EVAL_INTERVAL)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     service.init_db()
     poller = asyncio.create_task(_poll_loop())
     health = asyncio.create_task(_health_loop())
+    alerts = asyncio.create_task(_alert_loop())
     # 启动即做一次健康探测
     await service.health_monitor_once()
     yield
     poller.cancel()
     health.cancel()
+    alerts.cancel()
     await node_client.close()
 
 
@@ -107,6 +125,33 @@ async def reconcile(dep_id: str):
 @app.get("/api/events")
 async def events(limit: int = 30):
     return service.recent_events(limit)
+
+
+@app.get("/api/reliability")
+async def get_reliability():
+    """全部节点的加载可靠性告警、阈值与观察窗样本。"""
+    reliability.evaluate_all()
+    return reliability.reliability_state()
+
+
+@app.get("/api/nodes/{node_id}/reliability")
+async def get_node_reliability(node_id: str):
+    if node_id not in config.NODE_MAP:
+        raise HTTPException(404, "节点不存在")
+    reliability.evaluate_all()
+    return reliability.reliability_state(node_id)
+
+
+@app.put("/api/nodes/{node_id}/alert-settings")
+async def update_alert_settings(node_id: str, body: AlertSettingsBody):
+    """网页可调的告警阈值：观察窗、最低样本数、异常比例。"""
+    if node_id not in config.NODE_MAP:
+        raise HTTPException(404, "节点不存在")
+    try:
+        return reliability.set_settings(
+            node_id, body.window_seconds, body.min_samples, body.abnormal_ratio)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
 
 
 @app.post("/api/nodes/{node_id}/control")

@@ -39,6 +39,12 @@ LOAD_TIMEOUT = float(os.environ.get("LOAD_TIMEOUT", "30"))
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1.0"))
 # 节点健康探测间隔
 HEALTH_INTERVAL = float(os.environ.get("HEALTH_INTERVAL", "10.0"))
+# 加载可靠性告警：观察窗（秒）、最低样本数、异常比例阈值
+ALERT_WINDOW_SECONDS = float(os.environ.get("ALERT_WINDOW_SECONDS", "300"))
+ALERT_MIN_SAMPLES = int(os.environ.get("ALERT_MIN_SAMPLES", "3"))
+ALERT_ABNORMAL_RATIO = float(os.environ.get("ALERT_ABNORMAL_RATIO", "0.5"))
+# 告警评估/逾期判定周期（秒）
+ALERT_EVAL_INTERVAL = float(os.environ.get("ALERT_EVAL_INTERVAL", "2.0"))
 
 NODES: list[NodeConfig] = _nodes_from_env()
 NODE_MAP: dict[str, NodeConfig] = {n.node_id: n for n in NODES}

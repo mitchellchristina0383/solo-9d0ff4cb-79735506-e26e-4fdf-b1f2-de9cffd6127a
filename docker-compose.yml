@@ -10,6 +10,10 @@ services:
       LOAD_TIMEOUT: "30"
       POLL_INTERVAL: "1"
       HEALTH_INTERVAL: "10"
+      ALERT_WINDOW_SECONDS: "300"
+      ALERT_MIN_SAMPLES: "3"
+      ALERT_ABNORMAL_RATIO: "0.5"
+      ALERT_EVAL_INTERVAL: "2"
     ports:
       - "8000:8000"
     volumes:
